@@ -22,10 +22,20 @@ from nav_msgs.msg import Path
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import CompressedImage
 
+isExit = False
+isConnected = False
+
+# ROBOT NAME, ID, PASS
+ROBOT_NAME = "Clement Ackermann Car"
+ROBOT_ID = "8ea6b398-0732-42cb-9fa5-c30bab75cc68" # uuid
+ROBOT_PASS = "" # use md5 value of real password
+
 # some data of ros is not continuous stream. so we save the data, and send them to clients in a loop.
+ROS_DATA_FRAME_RATE = 10
 # So we need define the cycle(unit: second) for each kinds of data sent to clients
 MAP_SENT_CYCLE_TIME = 5
 TF_SENT_CYCLE_TIME = 0.1
+LASER_SENT_CYCLE_TIME = 0.5
 
 # TF listener timeout
 TF_LISTEN_TIMEOUT = 30
@@ -37,17 +47,11 @@ max_steering_angle = 0.5
 # 超过这个抖动角度后，才开始计算转向角度，而且还要减去这个抖动的角度数值
 straight_delta_angle = 0.18
 
-websocket_users = set()
+# lidar has a max distance limited, so ranges data will have value named "Infinity", we need replace this into the max distance value
+LASER_Infinity_value = "0.0"  # 10m
 
-# 接收客户端消息并处理，这里只是简单把客户端发来的返回回去
-async def recv_user_msg(websocket):
-    global webcmd
-    global websocket_users
-
-    websocket_users.add(websocket)
-    
-    while True:
-        recv_text = await websocket.recv()
+async def client_msg_process(client_socket):
+    async for recv_text in client_socket:
         # print("recv_text:%s" %(recv_text))
 
         jsonMsg = json.loads(recv_text)
@@ -61,7 +65,8 @@ async def recv_user_msg(websocket):
 
             response_text = json.dumps(resData)
             print("send response: %s" %(response_text))
-            await websocket.send(response_text)
+            await client_socket.send(response_text)
+
         elif jsonMsg['cmd'] == "joystick" :
             # json string : '{"cmd":"joystick", "id":"0", "password":"123456", "sticks":{"s":"UP","x":1,"y":2}, "btnL":"UP", "btnR":"UP","rotate":{"y":0,"x":1}}';
             # jsonMsg['id'] is the index of robots
@@ -127,6 +132,8 @@ async def recv_user_msg(websocket):
         elif jsonMsg['cmd'] == "gettf" :
             # json string : '{"cmd":"gettf", "id":"0", "password":"123456", "base_frame_id":"map", "frame_id":"base_foot_print"}'
             webcmd.listen_tf_pose(jsonMsg['base_frame_id'], jsonMsg['frame_id'])
+        elif jsonMsg['cmd'] == "role_accepted" :
+            print("indicate robot role accepted!")
         else :
             print("unkown msg: %s" %(recv_text))
             resData['cmd'] = "error"
@@ -134,63 +141,40 @@ async def recv_user_msg(websocket):
 
             response_text = json.dumps(resData)
             print("send response: %s" %(response_text))
-            await websocket.send(response_text)
+            await client_socket.send(response_text)
 
-async def sendToAllClients(jsonmsg):
-    global websocket_users
+async def setup_websocket_conn(wsurl):
+    global isConnected
+    global isExit
 
-    client_closed = []
-    for client in websocket_users:
+    loop = asyncio.get_event_loop()
+
+    while not rospy.is_shutdown() and not isExit:
         try:
-            await client.send(jsonmsg)
+            async with websockets.connect(wsurl) as websocket:
+                print("server connected!")
+                isConnected = True
+
+                # send a cmd to indicate I'm ROBOT
+                cmdmsg = '{"cmd":"role", "type":"robot", "subtype":"ackermann_car", "name":"' + ROBOT_NAME + '","uid":"'+ ROBOT_ID +'"}'
+                await websocket.send(cmdmsg)
+
+                # client websocket receive msg process task
+                recv_task = loop.create_task(client_msg_process(websocket))
+                submit_task = loop.create_task(submitThread(websocket))
+                await recv_task
+                await submit_task
         except websockets.ConnectionClosed:
             print("ConnectionClosed...")    # 链接断开
-            client_closed.append(client)
+            isConnected = False
         except websockets.InvalidState:
             print("InvalidState...")    # 无效状态
         except Exception as e:
             print("Exception:", e)
-    
-    # remove client disconnected
-    for client in client_closed:
-        websocket_users.remove(client)
 
-# 服务器端主逻辑
-async def run(websocket, path):
-    global webcmd
-    while True:
-        try:
-            await recv_user_msg(websocket)
-        except websockets.ConnectionClosed:
-            print("ConnectionClosed...", path)    # 链接断开
-            print("websocket_users old:", websocket_users)
-            websocket_users.remove(websocket)
-            print("websocket_users new:", websocket_users)
-
-            # when connection close, stop the car!
-            webcmd.send_car_cmd(0, 0)
-            break
-        except websockets.InvalidState:
-            print("InvalidState...")    # 无效状态
-            break
-        except Exception as e:
-            print("Exception:", e)
-
-def threadcreate_callback():
-    host_address = rospy.get_param('~address',"127.0.0.1")
-    port = int(rospy.get_param('~port','8181'))
-
-    # this is a thread, so we use new_event_loop to create a new loop for this thread
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    ws_server = websockets.serve(run, host_address, 8181)
-
-    print("%s:%d websocket start..." %(host_address, port))
-
-    loop.run_until_complete(ws_server)
-    loop.run_forever() # this is missing
-    loop.close()
+        isConnected = False
+        print("server disconnected!")
+        await asyncio.sleep(5)
 
 def goal_result_callback(result):
     global webcmd
@@ -222,6 +206,7 @@ class webcmd_forward:
         self.last_cmd_time = 0.0
 
         self.last_tf_sent_time = rospy.get_time()
+        self.last_laser_sent_time = rospy.get_time()
 
         self.goal_status = None
         self.goal_update = False # True: has goal result msg, need send to client
@@ -263,7 +248,7 @@ class webcmd_forward:
         self.tfTransDict_lock = threading.Lock()
         
         # 20Hz because we want to support camera image frame rate up to 20 frames / seconds (if camera framerate is > 20, then will drop some of data)
-        self.rate = rospy.Rate(20)
+        self.rate = rospy.Rate(ROS_DATA_FRAME_RATE)
 
     def startSubscribers(self):
         # navigation result
@@ -354,8 +339,7 @@ class webcmd_forward:
         self.goal_status = result
         self.goal_update = True
     
-    async def send_goal_result_toClients(self, cur_time):
-        global websocket_users
+    async def send_goal_result_toClients(self, cur_time, client_socket):
         if self.goal_update :
             resData = {}
             resData['cmd'] = "goal_result"
@@ -365,7 +349,7 @@ class webcmd_forward:
 
             response_text = json.dumps(resData)
 
-            await sendToAllClients(response_text)
+            await client_socket.send(response_text)
             
             self.goal_update = False
     
@@ -373,8 +357,10 @@ class webcmd_forward:
         self.laser_scan_data = laser
         self.laser_scan_update = True
 
-    async def send_laser_scan_toClients(self, cur_time):
-        global websocket_users
+    async def send_laser_scan_toClients(self, cur_time, client_socket):
+        if cur_time - self.last_laser_sent_time < LASER_SENT_CYCLE_TIME:
+            return
+        
         if self.laser_scan_update :
             resData = {}
             resData['cmd'] = "laser_scan"
@@ -390,17 +376,18 @@ class webcmd_forward:
             resData['intensities'] = self.laser_scan_data.intensities
 
             response_text = json.dumps(resData)
+            response_text = response_text.replace("Infinity", LASER_Infinity_value)
 
-            await sendToAllClients(response_text)
+            await client_socket.send(response_text)
             
             self.laser_scan_update = False
+            self.last_laser_sent_time = cur_time
     
     def global_navpath_inform(self, path):
         self.global_navpath_data = path
         self.global_navpath_update = True
 
-    async def send_global_navpath_toClients(self, cur_time):
-        global websocket_users
+    async def send_global_navpath_toClients(self, cur_time, client_socket):
         if self.global_navpath_update :
             resData = {}
             resData['cmd'] = "global_navpath"
@@ -423,7 +410,7 @@ class webcmd_forward:
 
             response_text = json.dumps(resData)
 
-            await sendToAllClients(response_text)
+            await client_socket.send(response_text)
             
             self.global_navpath_update = False
     
@@ -431,8 +418,7 @@ class webcmd_forward:
         self.local_navpath_data = path
         self.local_navpath_update = True
 
-    async def send_local_navpath_toClients(self, cur_time):
-        global websocket_users
+    async def send_local_navpath_toClients(self, cur_time, client_socket):
         if self.local_navpath_update :
             resData = {}
             resData['cmd'] = "local_navpath"
@@ -455,7 +441,7 @@ class webcmd_forward:
 
             response_text = json.dumps(resData)
 
-            await sendToAllClients(response_text)
+            await client_socket.send(response_text)
             
             self.local_navpath_update = False
 
@@ -463,9 +449,7 @@ class webcmd_forward:
         self.map_data = map
         self.map_update = True
 
-    async def send_map_toClients(self, cur_time):
-        global websocket_users
-
+    async def send_map_toClients(self, cur_time, client_socket):
         if cur_time - self.last_map_sent_time > MAP_SENT_CYCLE_TIME or self.map_update:
             resData = {}
             resData['cmd'] = "world_map"
@@ -495,7 +479,7 @@ class webcmd_forward:
 
             response_text = json.dumps(resData)
 
-            await sendToAllClients(response_text)
+            await client_socket.send(response_text)
             
             self.map_update = False
             self.last_map_sent_time = cur_time
@@ -504,9 +488,7 @@ class webcmd_forward:
         self.camera_data = image
         self.camera_update = True
 
-    async def send_camera_toClients(self, cur_time):
-        global websocket_users
-
+    async def send_camera_toClients(self, cur_time, client_socket):
         if self.camera_update:
             resData = {}
             resData['cmd'] = "camera_image"
@@ -517,7 +499,7 @@ class webcmd_forward:
 
             response_text = json.dumps(resData)
 
-            await sendToAllClients(response_text)
+            await client_socket.send(response_text)
             
             self.camera_update = False
 
@@ -612,9 +594,7 @@ class webcmd_forward:
                 self.send_car_cmd(0, 0)
                 print("WebCtrl cmd Timeout to stop car!")
 
-    async def send_tf_toClients(self, cur_time):
-        global websocket_users
-
+    async def send_tf_toClients(self, cur_time, client_socket):
         if cur_time - self.last_tf_sent_time < TF_SENT_CYCLE_TIME:
             return
 
@@ -640,30 +620,32 @@ class webcmd_forward:
 
                     response_text = json.dumps(resData)
 
-                    await sendToAllClients(response_text)
+                    await client_socket.send(response_text)
         
         self.last_tf_sent_time = cur_time
 
-    def timeoutCheckThread(self):
-        while not rospy.is_shutdown():
-            cur_time = rospy.get_time()
+async def submitThread(client_socket):
+    global webcmd
+    global isConnected
+    global isExit
 
-            self.check_car_cmd_timeout(cur_time)
-            self.check_timeout_tf(cur_time)
-            self.update_tf()
+    while not rospy.is_shutdown() and not isExit and isConnected:
+        cur_time = rospy.get_time()
 
-            # this is not a thread, it is main process. so we use get_event_loop to get the loop
-            loop = asyncio.get_event_loop()
-            future = asyncio.gather(self.send_tf_toClients(cur_time), 
-                            self.send_goal_result_toClients(cur_time), 
-                            self.send_laser_scan_toClients(cur_time), 
-                            self.send_global_navpath_toClients(cur_time),
-                            self.send_local_navpath_toClients(cur_time),
-                            self.send_map_toClients(cur_time),
-                            self.send_camera_toClients(cur_time))
-            result = loop.run_until_complete(future)
-            
-            self.rate.sleep()
+        webcmd.check_car_cmd_timeout(cur_time)
+        webcmd.check_timeout_tf(cur_time)
+        webcmd.update_tf()
+
+        await webcmd.send_tf_toClients(cur_time, client_socket)
+        await webcmd.send_goal_result_toClients(cur_time, client_socket)
+        await webcmd.send_laser_scan_toClients(cur_time, client_socket)
+        await webcmd.send_global_navpath_toClients(cur_time, client_socket)
+        await webcmd.send_local_navpath_toClients(cur_time, client_socket)
+        await webcmd.send_map_toClients(cur_time, client_socket)
+        await webcmd.send_camera_toClients(cur_time, client_socket)
+        
+        # about 10 times per second
+        await asyncio.sleep(0.1)
 
 if __name__ == '__main__':
     try:
@@ -679,12 +661,14 @@ if __name__ == '__main__':
         print("ros time service connected!")
 
         webcmd = webcmd_forward()
-        server = threading.Thread(target=threadcreate_callback, daemon=True)
-        server.start()
-
         webcmd.startSubscribers()
-        #webcmd.listen_tf_pose("map", "base_footprint")
-        webcmd.timeoutCheckThread()
+
+        host_address = rospy.get_param('~address',"127.0.0.1")
+        port = rospy.get_param('~port','8181')
+        ws_url = "ws://{0}:{1}".format(host_address, port)
+
+        asyncio.get_event_loop().run_until_complete(setup_websocket_conn(ws_url))
 
     except KeyboardInterrupt:
+        isExit = True
         print("Shutting down webcmd_forward node.")
