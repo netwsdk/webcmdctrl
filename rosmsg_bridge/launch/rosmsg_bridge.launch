@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+
+<launch>
+    <!-- web cmd forward port -->
+    <arg name="server_address"    default="127.0.0.1" />
+    <arg name="server_port"       default="8001" />
+
+    <node name="ros_msg_bridge"   pkg="rosmsg_bridge"  type="rosmsg_bridge.py" output="screen">
+        <param name="server_address" type="string" value="$(arg server_address)" />
+        <param name="server_port"  value="$(arg server_port)"/> 
+    </node>
+</launch>

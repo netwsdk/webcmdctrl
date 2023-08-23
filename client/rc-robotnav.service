@@ -1,0 +1,15 @@
+[Unit]
+Description=/etc/rc-robotnav.local Compatibility
+ConditionPathExists=/etc/rc-robotnav.local
+After=display-manager.service syslog.target network.target multi-user.target nodm.service
+ 
+[Service]
+Type=forking
+ExecStart=/etc/rc-robotnav.local start
+TimeoutSec=0
+StandardOutput=tty
+RemainAfterExit=yes
+SysVStartPriority=99
+ 
+[Install]
+WantedBy=multi-user.target
